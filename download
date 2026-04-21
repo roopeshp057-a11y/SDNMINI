@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""
+topology.py  ─  Mininet Topology for Traffic Classification Assignment
+======================================================================
+Creates a simple star topology that is ideal for demonstrating
+traffic classification:
+
+          [  s1  ]   ← OVS switch (OpenFlow 1.0)
+         /  | | | \\
+        h1 h2 h3 h4 h5
+
+  h1  10.0.0.1  – TCP traffic generator
+  h2  10.0.0.2  – UDP traffic generator
+  h3  10.0.0.3  – ICMP / ping source
+  h4  10.0.0.4  – Mixed traffic / iperf server
+  h5  10.0.0.5  – Monitoring / capture host
+
+Usage:
+  # Start POX first (Terminal 1)
+  cd pox && ./pox.py openflow.of_01 --port=6633 \
+            traffic_classifier.traffic_classifier
+
+  # Then start Mininet (Terminal 2)
+  sudo python3 topology/topology.py
+
+  # Or via mn --custom
+  sudo mn --custom topology/topology.py --topo classifier \
+          --controller remote,ip=127.0.0.1,port=6633 \
+          --switch ovsk,protocols=OpenFlow10
+"""
+
+import time
+from mininet.topo       import Topo
+from mininet.net        import Mininet
+from mininet.node       import RemoteController, OVSSwitch
+from mininet.cli        import CLI
+from mininet.log        import setLogLevel, info, error
+from mininet.link       import TCLink
+
+
+# ── Topology definition ───────────────────────────────────────────────────────
+
+class ClassifierTopo(Topo):
+    """
+    Star topology: 1 switch, 5 hosts.
+    Link parameters simulate a realistic LAN.
+    """
+
+    def build(self, n_hosts=5, bw=100, delay="5ms"):
+        switch = self.addSwitch("s1", dpid="0000000000000001")
+
+        host_cfg = [
+            dict(ip="10.0.0.1/24", mac="00:00:00:00:00:01", defaultRoute="via 10.0.0.254"),
+            dict(ip="10.0.0.2/24", mac="00:00:00:00:00:02", defaultRoute="via 10.0.0.254"),
+            dict(ip="10.0.0.3/24", mac="00:00:00:00:00:03", defaultRoute="via 10.0.0.254"),
+            dict(ip="10.0.0.4/24", mac="00:00:00:00:00:04", defaultRoute="via 10.0.0.254"),
+            dict(ip="10.0.0.5/24", mac="00:00:00:00:00:05", defaultRoute="via 10.0.0.254"),
+        ]
+
+        for i, cfg in enumerate(host_cfg[:n_hosts], start=1):
+            host = self.addHost(f"h{i}", **cfg)
+            self.addLink(switch, host, bw=bw, delay=delay)
+
+
+# ── topos dict (used by `mn --custom`) ───────────────────────────────────────
+topos = {"classifier": ClassifierTopo}
+
+
+# ── Scenario helpers ──────────────────────────────────────────────────────────
+
+def _wait_for_flows(net, timeout=8):
+    """Give the controller time to push flow rules."""
+    info("*** Waiting for flow rules to propagate...\n")
+    time.sleep(timeout)
+
+
+def run_scenario_1_allowed_vs_blocked(net):
+    """
+    Scenario 1: Allowed vs Blocked traffic
+    ────────────────────────────────────────
+    • h3 pings h4  (ICMP – allowed by default)
+    • h2 sends UDP to h4  (UDP – allowed by default)
+    • h1 sends TCP to blocked port 23 on h4  (TCP port 23 blocked)
+    • h1 sends TCP to allowed port 80 on h4  (TCP port 80 allowed)
+    """
+    info("\n" + "═"*60 + "\n")
+    info("SCENARIO 1: Allowed vs Blocked Traffic\n")
+    info("═"*60 + "\n")
+
+    h1, h2, h3, h4 = [net.get(f"h{i}") for i in range(1, 5)]
+
+    # ── ICMP test (should succeed) ────────────────────────────────────
+    info("\n[1a] ICMP: h3 → h4  (expect: SUCCESS)\n")
+    result = h3.cmd("ping -c 4 -W 2 10.0.0.4")
+    _print_ping_result(result, expect_success=True)
+
+    # ── UDP test (should succeed) ─────────────────────────────────────
+    info("\n[1b] UDP iperf: h2 → h4  (expect: SUCCESS)\n")
+    h4.cmd("iperf -s -u -D -p 5001 2>/dev/null")
+    time.sleep(0.5)
+    result = h2.cmd("iperf -c 10.0.0.4 -u -t 4 -p 5001 2>&1")
+    _print_iperf_result(result, proto="UDP", expect_success=True)
+    h4.cmd("pkill iperf 2>/dev/null")
+
+    # ── TCP allowed port 80 (should succeed) ─────────────────────────
+    info("\n[1c] TCP port 80: h1 → h4  (expect: SUCCESS)\n")
+    h4.cmd("python3 -m http.server 80 &>/tmp/http.log &")
+    time.sleep(1)
+    result = h1.cmd("curl -s --max-time 5 http://10.0.0.4:80/ -o /dev/null -w '%{http_code}'")
+    info(f"  HTTP response code: {result.strip()}  "
+         f"({'PASS' if '200' in result else 'FAIL'})\n")
+    h4.cmd("pkill -f 'http.server'")
+
+    # ── TCP blocked port 23 (should fail) ────────────────────────────
+    info("\n[1d] TCP port 23 (Telnet): h1 → h4  (expect: BLOCKED)\n")
+    result = h1.cmd("nc -zv -w 3 10.0.0.4 23 2>&1")
+    blocked = "refused" in result.lower() or "timed out" in result.lower() or "failed" in result.lower()
+    info(f"  Result: {'BLOCKED ✓' if blocked else 'ALLOWED (unexpected)'}\n")
+
+    info("\nScenario 1 complete.\n")
+
+
+def run_scenario_2_normal_vs_failure(net):
+    """
+    Scenario 2: Normal vs Link Failure
+    ────────────────────────────────────
+    • Normal: h1 → h4 iperf TCP (measure baseline throughput)
+    • Failure: bring h2's port down; verify h2 unreachable
+    • Recovery: restore h2; verify traffic resumes
+    """
+    info("\n" + "═"*60 + "\n")
+    info("SCENARIO 2: Normal vs Link Failure / Recovery\n")
+    info("═"*60 + "\n")
+
+    h1, h2, h4 = net.get("h1"), net.get("h2"), net.get("h4")
+    s1         = net.get("s1")
+
+    # ── Baseline TCP throughput ───────────────────────────────────────
+    info("\n[2a] Normal TCP: h1 → h4 (baseline throughput)\n")
+    h4.cmd("iperf -s -D 2>/dev/null")
+    time.sleep(0.5)
+    result = h1.cmd("iperf -c 10.0.0.4 -t 5 2>&1")
+    _print_iperf_result(result, proto="TCP", expect_success=True)
+    h4.cmd("pkill iperf 2>/dev/null")
+
+    # ── Bring h2 link down ────────────────────────────────────────────
+    info("\n[2b] Simulating link failure: taking h2 offline...\n")
+    h2.cmd("ip link set h2-eth0 down")
+    time.sleep(1)
+
+    result = h1.cmd("ping -c 3 -W 2 10.0.0.2 2>&1")
+    reachable = "0% packet loss" in result
+    info(f"  h1 → h2 after failure: {'reachable (unexpected)' if reachable else 'UNREACHABLE ✓'}\n")
+
+    # ── Restore link ─────────────────────────────────────────────────
+    info("\n[2c] Restoring h2 link...\n")
+    h2.cmd("ip link set h2-eth0 up")
+    time.sleep(2)
+
+    result = h1.cmd("ping -c 3 -W 2 10.0.0.2 2>&1")
+    reachable = "0 received" not in result and "100% packet loss" not in result
+    info(f"  h1 → h2 after recovery: {'REACHABLE ✓' if reachable else 'still unreachable'}\n")
+
+    info("\nScenario 2 complete.\n")
+
+
+def run_traffic_mix(net, duration=15):
+    """
+    Generate a realistic mix of TCP / UDP / ICMP traffic
+    so the classifier dashboard shows meaningful numbers.
+    """
+    info("\n*** Generating mixed traffic for classification demo...\n")
+    h1, h2, h3, h4, h5 = [net.get(f"h{i}") for i in range(1, 6)]
+
+    # ICMP continuous ping in background
+    h3.cmd("ping -i 0.5 10.0.0.4 &>/tmp/ping.log &")
+
+    # UDP iperf
+    h4.cmd("iperf -s -u -p 5002 -D 2>/dev/null")
+    h2.cmd(f"iperf -c 10.0.0.4 -u -t {duration} -p 5002 -b 1M &>/tmp/udp.log &")
+
+    # TCP iperf
+    h4.cmd("iperf -s -p 5003 -D 2>/dev/null")
+    h1.cmd(f"iperf -c 10.0.0.4 -t {duration} -p 5003 &>/tmp/tcp.log &")
+
+    info(f"*** Traffic running for {duration}s – watch the dashboard!\n")
+    time.sleep(duration)
+
+    # Clean up background processes
+    for h in [h1, h2, h3, h4, h5]:
+        h.cmd("pkill ping pkill iperf 2>/dev/null")
+
+
+# ── Result printers ───────────────────────────────────────────────────────────
+
+def _print_ping_result(output: str, expect_success: bool):
+    success = "0% packet loss" in output
+    match   = success == expect_success
+    for line in output.splitlines():
+        if "packet loss" in line or "rtt" in line:
+            info(f"  {line.strip()}\n")
+    info(f"  Result: {'PASS ✓' if match else 'FAIL ✗'}\n")
+
+
+def _print_iperf_result(output: str, proto: str, expect_success: bool):
+    for line in output.splitlines():
+        if "bits/sec" in line:
+            info(f"  [{proto}] {line.strip()}\n")
+    has_data = "bits/sec" in output
+    match    = has_data == expect_success
+    info(f"  Result: {'PASS ✓' if match else 'FAIL ✗'}\n")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def run(scenario=None, controller_ip="127.0.0.1", controller_port=6633):
+    setLogLevel("info")
+    topo = ClassifierTopo()
+    net  = Mininet(
+        topo       = topo,
+        switch     = OVSSwitch,
+        controller = None,
+        link       = TCLink,
+        autoSetMacs= False,
+    )
+
+    net.addController(
+        "c0",
+        controller = RemoteController,
+        ip         = controller_ip,
+        port       = controller_port,
+    )
+
+    net.start()
+
+    # Force OpenFlow 1.0 on every switch
+    for sw in net.switches:
+        sw.cmd(f"ovs-vsctl set bridge {sw.name} protocols=OpenFlow10")
+        info(f"*** {sw.name} set to OpenFlow 1.0\n")
+
+    _wait_for_flows(net)
+
+    if scenario == "1":
+        run_scenario_1_allowed_vs_blocked(net)
+    elif scenario == "2":
+        run_scenario_2_normal_vs_failure(net)
+    elif scenario == "mix":
+        run_traffic_mix(net)
+    elif scenario == "all":
+        run_traffic_mix(net, duration=10)
+        run_scenario_1_allowed_vs_blocked(net)
+        run_scenario_2_normal_vs_failure(net)
+    else:
+        info("*** No scenario specified – starting CLI\n")
+        info("*** Tip: generate traffic with  run_traffic_mix(net)\n")
+
+    CLI(net)
+    net.stop()
+
+
+if __name__ == "__main__":
+    import sys
+    sc = sys.argv[1] if len(sys.argv) > 1 else None
+    run(scenario=sc)
